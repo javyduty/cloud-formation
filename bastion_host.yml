@@ -1,0 +1,55 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+  Environment:
+    Type: String
+    Default: Environment
+    Description: Environment variable (dev, qa, prod).
+  VpcId:
+    Type: String
+    Default: {VpcId}
+    Description: The vpc id.
+  VpcCidrBlock:
+    Type: String
+    Default: {VpcCidrBlock}
+    Description: The Cidr block for the vpc.
+  KeyName:
+    Type: String
+    Default: {KeyName}
+    Description: The keypair name for the key to connect to the ecs instance.
+
+Resources:
+  BastionHostKeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub KeyName
+
+  BastionHost:
+    Type: AWS::EC2::Instance
+    DependsOn: BastionHostSecurityGroup
+    Properties:
+      ImageId: ami-0b0dcb5067f052a63
+      InstanceType: t2.micro
+      KeyName: !Ref BastionHostKeyPair
+      BlockDeviceMappings:
+        - DeviceName: "/dev/xvda"
+          Ebs:
+            Encrypted: 'true'
+      SecurityGroupIds:
+        - !Ref BastionHostSecurityGroup
+      SubnetId:
+        Fn::ImportValue: !Sub natgateway-sub-${Environment}
+      Tags:
+        - Key: Name
+          Value: !Sub BastionHost-${Environment}
+
+  BastionHostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Open Port 22 for ssh into bastion host
+      VpcId:
+        Fn::ImportValue: !Sub VpcId-${Environment}
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 
+            Fn::ImportValue: !Sub VpcCidrBlock-${Environment}
