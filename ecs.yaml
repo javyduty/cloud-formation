@@ -1,0 +1,362 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+  Environment:
+    Type: String
+    Default: Environment
+    Description: Environment variable (dev, qa, prod).
+  EFS:
+    Type: String
+    Default: {EFS}
+    Description: EFS id variable.
+  EFSAccessPoint:
+    Type: String
+    Default: {EFSAccessPointValue}
+    Description: EFS access point id variable.
+  SourceVolume:
+    Type: String
+    Default: {SourceVolume}
+    Description: Source volume to mount the efs.
+  VpcId:
+    Type: String
+    Default: {VpcId}
+    Description: The vpc id.
+  VpcCidrBlock:
+    Type: String
+    Default: {VpcCidrBlock}
+    Description: The Cidr block for the vpc.
+  VPCAppSubnet1:
+    Type: String
+    Default: {VPCAppSubnet1}
+    Description: The application subnet for the vpc.
+  VPCAppSubnet2:
+    Type: String
+    Default: {VPCAppSubnet2}
+    Description: The other application subnet for the vpc.
+  KeyName:
+    Type: String
+    Default: {KeyName}
+    Description: The keypair name for the key to connect to the ecs instance.
+
+Resources:
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: cluster
+  
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: Task-definition
+      TaskRoleArn: !Ref ECSTaskRole
+      ExecutionRoleArn: !Ref ECSExecutionRole
+      NetworkMode: bridge
+      Volumes:
+        - Name: !Sub Volume
+          EFSVolumeConfiguration:
+            AuthorizationConfig:
+              AccessPointId: 
+                Fn::ImportValue: !Sub 'EFSAccessPoint' # EFS access point previously provisioned 
+            FilesystemId:
+              Fn::ImportValue: !Sub 'EFS'
+            RootDirectory: '/'
+            TransitEncryption: ENABLED
+      ContainerDefinitions:
+        - Name: !Sub Container
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/{imagePath}
+          PortMappings:
+            - HostPort: 8080
+              Protocol: tcp
+              ContainerPort: 8080
+          Essential: true
+          MemoryReservation: 5000
+          MountPoints:
+            - ContainerPath: '/root'
+              SourceVolume: !Sub SourceVolume
+      RequiresCompatibilities:
+        - EC2
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Open Ports
+      VpcId:
+        Fn::ImportValue: !Sub VpcId
+      SecurityGroupIngress:
+        - IpProtocol: '-1' # All ports
+          CidrIp:
+            Fn::ImportValue: !Sub VpcCidrBlock # This is a parameter filled in on the console
+        - IpProtocol: tcp
+          FromPort: "8080"
+          ToPort: "8080"
+          CidrIp: '0.0.0.0/0' # Open to the internet
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp:
+            Fn::ImportValue: !Sub VpcCidrBlock # This is a parameter filled in on the console
+  
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: NLBListener
+    Properties:
+      TaskDefinition: !Ref TaskDefinition
+      Cluster: !Ref Cluster
+      LaunchType: EC2
+      SchedulingStrategy: REPLICA
+      DesiredCount: 1
+      ServiceName: Service
+
+  NLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: NLB
+      Scheme: internal
+      Type: network
+      Subnets:
+        - Fn::ImportValue: !Sub VPCAppSubnet1
+        - Fn::ImportValue: !Sub VPCAppSubnet2
+  
+  NLBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn: NLB
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ECSTargetGroup
+      LoadBalancerArn: !Ref NLB
+      Port: '8080'
+      Protocol: TCP
+
+  ECSTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: NLB
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Name: ECSTargetGroup
+      Port: 8080
+      Protocol: TCP
+      UnhealthyThresholdCount: 2
+      VpcId:
+        Fn::ImportValue: !Sub VpcId
+
+  ECSAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub VPCAppSubnet1
+      LaunchConfigurationName: !Ref ContainerInstance
+      MinSize: '1'
+      MaxSize: '2'
+      DesiredCapacity: '1'
+    UpdatePolicy:
+      AutoScalingReplacingUpdate:
+        WillReplace: 'true'
+
+  ApplicationKeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub KeyName
+
+  ContainerInstanceHome:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: ami-0bddd4073d6eba21d # Ecs optimized image from aws marketplace
+      SecurityGroups:
+        - !Ref ECSSecurityGroup
+      InstanceType: m5n.2xlarge
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      KeyName: !Ref KeyPair
+      UserData: !Base64
+        'Fn::Join':
+          - ''
+          - - |
+              #!/bin/bash -xe
+            - echo ECS_CLUSTER=
+            - !Ref Cluster
+            - |2
+               >> /etc/ecs/ecs.config
+              |+
+
+  ECSServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: ecs-service
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'elasticloadbalancing:DeregisterInstancesFromLoadBalancer'
+                  - 'elasticloadbalancing:DeregisterTargets'
+                  - 'elasticloadbalancing:Describe*'
+                  - 'elasticloadbalancing:RegisterInstancesWithLoadBalancer'
+                  - 'elasticloadbalancing:RegisterTargets'
+                  - 'ec2:Describe*'
+                  - 'ec2:AuthorizeSecurityGroupIngress'
+                Resource: '*'
+
+  AutoscalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - application-autoscaling.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: service-autoscaling
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'application-autoscaling:*'
+                  - 'cloudwatch:DescribeAlarms'
+                  - 'cloudwatch:PutMetricAlarm'
+                  - 'ecs:DescribeServices'
+                  - 'ecs:UpdateService'
+                Resource: '*'
+  
+  ServiceScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: HomeService
+    Properties:
+      MaxCapacity: 2
+      MinCapacity: 1
+      ResourceId: !Join
+        - ''
+        - - service/
+          - !Ref Cluster
+          - /
+          - !GetAtt
+            - Service
+            - Name
+      RoleARN: !GetAtt
+        - AutoscalingRole
+        - Arn
+      ScalableDimension: 'ecs:service:DesiredCount'
+      ServiceNamespace: ecs
+  
+  ServiceScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    DependsOn: ServiceScalingTarget
+    Properties:
+      PolicyName: AStepPolicy
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref ServiceScalingTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: PercentChangeInCapacity
+        Cooldown: 60
+        MetricAggregationType: Average
+        StepAdjustments:
+          - MetricIntervalLowerBound: 0
+            ScalingAdjustment: 200
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: ECS-Service-Policy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecs:DescribeTags'
+                  - 'ecs:CrreateCluster'
+                  - 'ecs:DeregisterContainerInstance'
+                  - 'ecs:DiscoverPollEndpoint'
+                  - 'ecs:Poll'
+                  - 'ecs:RegisterContainerInstance'
+                  - 'ecs:StartTelemetrySession'
+                  - 'ecs:UpdateContainerInstancesState'
+                  - 'ecs:Submit*'
+                  - 'ecr:GetAuthorizationToken'
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:BatchGetImage'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+      RoleName: ECS-Instance-Role
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Allows ECS tasks to call AWS services on your behalf.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: TaskExecutionRolePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecr:GetAuthorizationToken'
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:BatchGetImage'
+                  - 'ecr:DescribeImages'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+      RoleName: ECS-Task-Role
+  
+  ECSExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: >-
+        Allows ECS container agent to make calls to the Amazon ECS API on your
+        behalf.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+        - 'arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess'
+      RoleName: ECS-Execution-Role
+  
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EC2Role
