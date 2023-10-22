@@ -17,5 +17,5 @@ Resources:
     ComparisonOperator: GreaterThanThreshold
     Dimensions:
     - Name: InstanceId
-      Value:
+      Value: EC2-INSTANCE-ID
         Ref: EC2
