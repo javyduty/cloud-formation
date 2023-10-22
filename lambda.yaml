@@ -1,0 +1,52 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lambda function
+Parameters:
+  VPCAppSubnet1:
+    Type: String
+    Default: {VPCAppSubnet1}
+    Description: The application subnet for the vpc.
+  VPCAppSubnet2:
+    Type: String
+    Default: {VPCAppSubnet2}
+    Description: The other application subnet for the vpc.
+Resources:
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: Lambda-Log-Policy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+      RoleName: ECS-Instance-Role
+  Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !Ref Role
+      Code:
+        S3Bucket: s3-bucket
+        S3Key: function.zip
+      Runtime: nodejs18.x
+      Timeout: 5
+      TracingConfig:
+        Mode: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - SecurityGroup
+        SubnetIds:
+          - !Sub VPCAppSubnet1
+          - !Sub VPCAppSubnet2
